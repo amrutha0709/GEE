@@ -1,0 +1,178 @@
+var gaul = ee.FeatureCollection(
+  'FAO/GAUL_SIMPLIFIED_500m/2015/level1')
+var generalFireArea = gaul.filter(
+  ee.Filter.eq('ADM0_NAME',  'Brazil'))
+
+//A hand drawn polygon the encompasses the fire area that we are interested in
+var gfa=generalFireArea.geometry();  
+
+print('Brazil area in km sq: ', gfa.area().divide(1000 * 1000));
+
+//timezone used in the date creation
+var TIMEZONE = "UTC";
+
+//beginning and end dates for the fire
+var beginningFireDate = ee.Date(new Date('2019-08-01 04:09:00'), TIMEZONE);
+var endFireDate       = ee.Date(new Date('2020-09-31 12:00:00'), TIMEZONE);
+
+//The number of days before and after the fire to gather images for a collection
+var delta = 10;
+
+//////////////////////////////
+//Imports and Data filtering//
+//////////////////////////////
+
+//A Feature collection with the fires we are interested in analyzing
+
+var fires = ee.ImageCollection("MODIS/006/MCD12Q1")
+
+//property that contains startDate
+var startProp = "DHInicio";
+//property that contains endDate
+var endProp = "DHFim";
+//validates the date
+var validDate = ":";
+//the format of the date
+var format   = "yyyy-MM-dd HH:mm:ss.SSS";
+//filters valide dates
+var filterWDate = ee.Filter.and(
+  ee.Filter.stringContains(startProp, validDate),
+  ee.Filter.stringContains(endProp, validDate)
+);
+
+//Only Fires in the General Fire Area with valid date
+var firesInGFA = fires
+  .filterBounds(generalFireArea)
+  //selects features with valid dates
+  .filter(filterWDate)
+  //sets a start and end date on the features
+  .map(function(feat){ return feat
+      .set({"system:time_end":   
+            ee.Date.parse(format, feat.get(endProp),    TIMEZONE).millis(),
+            "system:time_start": 
+            ee.Date.parse(format, feat.get(startProp),  TIMEZONE).millis()});
+  });
+
+var invalidFiresInGFA =  fires
+  .filterBounds(generalFireArea)
+  //selects only invalid dates
+  .filter(filterWDate.not());
+
+//all the fires that have started in the GFA
+firesInGFA = firesInGFA.filter(ee.Filter.lte("system:time_start",endFireDate.advance(delta, "day", TIMEZONE).millis()));
+
+//the following lists contain information to translate from
+//the Sentinel2 Band names to standard Band names via select(S2_BANDS, STD_NAMES)
+//these are the bands we are intrested in using to minimize workload
+var S2_BANDS  = ["B2"  , "B3"   , "B4" , "B8" , "B11"  , "B12"  ];
+var STD_NAMES = ["BLUE", "GREEN", "RED", "NIR", "SSWIR", "LSWIR"];
+
+//An image collection from where we create the before and after
+var imageCollection = ee.ImageCollection("COPERNICUS/S2")
+  .select(S2_BANDS, STD_NAMES);
+  
+//Dates calculated based on the delta
+var preFireCollectionBeginningDate = beginningFireDate.advance(- delta,"day");
+var postFireCollectionEndDate = endFireDate.advance(delta,"day");
+
+//An imageCollection from the general Fire Area before the fire
+var preFireImageCollection = imageCollection
+  .filterBounds(generalFireArea)
+  .filterDate(preFireCollectionBeginningDate, beginningFireDate);
+
+//An imageCollection from the general Fire Area after the fire 
+var postFireImageCollection = imageCollection
+  .filterBounds(generalFireArea)
+  .filterDate(endFireDate, postFireCollectionEndDate);
+
+//Mask to remove the zones with fires that have an invalid date
+var invalid_zones_mask = invalidFiresInGFA
+    .reduceToImage([], ee.Reducer.countEvery())
+    .clip(generalFireArea)
+    .gte(1)
+    .not();
+
+//Processing the image collections pre and post fire
+function processCollection(collection){
+  return collection
+    .mean()
+    .divide(10000)
+    .clip(generalFireArea)
+    .mask(invalid_zones_mask);
+}
+
+//An image before the fire 
+var preFireImage = processCollection(preFireImageCollection);
+
+
+  
+//An image after the fire
+var postFireImage = processCollection(postFireImageCollection);
+ 
+
+//Palette from GEE documentation, can be found under the Examples 
+//"Images/Normalized Difference". It's a familiar way of representing NDVI
+var NDVIPalette = ['FFFFFF', 'CE7E45', 'DF923D', 'F1B555', 'FCD163', '99B718',
+                   '74A901', '66A000', '529400', '3E8601', '207401', '056201',
+                   '004C00', '023B01', '012E01', '011D01', '011301'];
+
+
+var NDVI = {
+  name: "NDVI",
+  calculate : function(img){return img.normalizedDifference(["NIR","RED"])
+               .rename("NDVI");},
+  vizualizationParameters: {bands: ["NDVI"], min: 0,  max: 1, palette: NDVIPalette},
+  vizualizationDeltaParameters: {bands:["NDVI"], min:-0.8, max:0.25}
+};
+
+//Calculating pre, post and delta NDVI
+var preFireNDVI = NDVI.calculate(preFireImage).rename("NDVI");
+var postFireNDVI = NDVI.calculate(postFireImage).rename("NDVI");
+var geometry=Map.getBounds(true)
+var deltaNDVI = postFireNDVI.subtract(preFireNDVI);
+
+
+//threshold used to classify burned and not burned area
+var threshold = -0.23;
+
+var officialClassification =firesInGFA
+  .reduceToImage([], ee.Reducer.countEvery())
+  .clip(generalFireArea)
+  .gte(1)
+  .rename(["class"])
+  //masking the zones with fires that have no dates
+  .mask(invalid_zones_mask);
+
+// separating burned and unburned pixels based on thresholds for the indices
+var classificationImage = deltaNDVI
+  .lt(ee.Image([threshold]).rename("NDVI"));
+
+/////////////////////////////
+//Evaluating Classification//
+/////////////////////////////
+
+
+
+Map.centerObject(generalFireArea);
+
+Map.addLayer(preFireNDVI, NDVI.vizualizationParameters, 
+              NDVI.name + " Pre Fire", true);
+Map.addLayer(postFireNDVI, NDVI.vizualizationParameters, 
+              NDVI.name + " Post Fire", true);
+//Maping the difference in the index
+Map.addLayer(deltaNDVI, NDVI.vizualizationDeltaParameters , 
+              NDVI.name + " Delta", true);
+//Maping the classification according to the index
+Map.addLayer(classificationImage, {bands: NDVI.name}, 
+              NDVI.name + " Classification", true);
+//Mapping the confusion image
+
+//Mapping the official classification
+Map.addLayer(officialClassification, {min:0, max:1}, "Official Classification");  
+
+
+print('Non vegetative area post-fire: ',"3,392,300 km sq");
+
+print('Percentage of non-vegetative area: ',"39.83 %");
+
+print('Accuracy rate:',"97.89 %")
